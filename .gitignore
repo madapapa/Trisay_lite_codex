@@ -7,3 +7,4 @@ models/
 test/
 .playwright-cli/
 .DS_Store
+design/
