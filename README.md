@@ -250,3 +250,33 @@ sequenceDiagram
 - 多人说话人分离
 - 自动摘要
 - 翻译
+
+## 6. 本地发布版启动
+
+开发模式可以继续使用 Vite 和 FastAPI 两个服务。日常使用时可以构建前端生产文件，并让 FastAPI 直接托管页面：
+
+```bash
+cd /Users/vtl/project/codex/trisay_lite/frontend
+npm run build
+```
+
+构建完成后，只需要启动后端：
+
+```bash
+cd /Users/vtl/project/codex/trisay_lite
+scripts/start_trisay.sh
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+也可以用 macOS 启动器：
+
+```bash
+cp -R "macos/Trisay Lite.app" /Applications/
+```
+
+复制后可通过 Spotlight 搜索 `Trisay Lite` 启动。启动器会检查 `127.0.0.1:8000` 是否已有服务；没有运行时会启动后端，并自动打开浏览器。

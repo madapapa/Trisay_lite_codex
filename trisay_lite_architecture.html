@@ -133,15 +133,15 @@
   <body>
     <header>
       <div class="brand">Trisay Lite</div>
-      <div class="meta">本地模型方案：Vue 3 + FastAPI + Whisper large-v3-turbo</div>
+      <div class="meta">本地应用方案：Vue 3 + FastAPI + mlx-whisper + 可切换本地模型</div>
     </header>
 
     <main>
       <section class="intro">
         <h1>技术架构与业务系统流程</h1>
         <p>
-          这份图基于本地 Apple Silicon 运行 Whisper large-v3-turbo 的方案，面向中文和 Bahasa Indonesia
-          会议转录，支持实时麦克风转录和上传录音文件。
+          这份图基于当前代码实现，面向中文、Bahasa Indonesia 和自动语言检测的本地转录工作流，
+          支持实时麦克风转录、上传媒体文件转录、模型下载 / 导入 / 启停，以及 macOS 应用启动器。
         </p>
         <div class="note">
           <div><strong>查看方式：</strong>直接用浏览器打开这个 HTML 文件即可。</div>
@@ -153,30 +153,37 @@
         <h2>1. 技术架构图</h2>
         <div class="mermaid">
 flowchart LR
-  User["用户浏览器<br/>Chrome / Safari"] --> Web["Vue 3 + Vite 前端"]
+  User["用户<br/>Chrome / Safari"] --> Launcher["macOS App / shell scripts<br/>启动本地服务并打开浏览器"]
+  Launcher --> Backend["FastAPI 后端<br/>127.0.0.1:8000"]
+  Backend --> Static["生产前端托管<br/>frontend/dist"]
+  Static --> Web["Vue 3 前端<br/>Dashboard / Settings"]
 
-  Web --> UI["界面组件<br/>Dashboard / Settings / Upload / Export"]
-  Web --> Audio["浏览器音频采集<br/>MediaRecorder / AudioWorklet"]
-  Web --> Store["Pinia 状态管理<br/>当前会话 / 转录文本 / 设置"]
+  Web --> Capture["浏览器录音<br/>MediaRecorder"]
+  Web --> Upload["上传媒体文件<br/>audio / video"]
+  Web --> ModelUI["模型管理界面<br/>Catalog / Local"]
+  Web --> HistoryUI["历史记录 / 导出 / 删除"]
 
-  Audio --> WS["WebSocket<br/>实时音频流"]
-  UI --> API["HTTP API<br/>上传 / 历史 / 导出 / 设置"]
+  Capture --> WS["WebSocket<br/>/transcriptions/live"]
+  Upload --> UploadAPI["HTTP<br/>/transcriptions/upload"]
+  ModelUI --> ModelAPI["HTTP<br/>/models*"]
+  HistoryUI --> SessionAPI["HTTP<br/>/sessions* / exports"]
 
-  WS --> Backend["FastAPI 后端"]
-  API --> Backend
+  WS --> Backend
+  UploadAPI --> Backend
+  ModelAPI --> Backend
+  SessionAPI --> Backend
 
-  Backend --> Session["会话管理<br/>Session Manager"]
-  Backend --> AudioService["音频处理<br/>ffmpeg 转码 / 切片"]
-  Backend --> VAD["语音活动检测<br/>Silero VAD"]
-  Backend --> ASR["本地语音识别<br/>mlx-whisper"]
-  ASR --> Model["Whisper large-v3-turbo<br/>Apple Silicon 本地模型"]
+  Backend --> DB[("SQLite<br/>sessions")]
+  Backend --> Storage[("storage/<br/>uploads / transcripts / exports / logs / model_settings.json")]
+  Backend --> ModelManager["model_manager.py<br/>下载 / 导入 / 选择 / 停止 / 删除"]
+  ModelManager --> HF["Hugging Face<br/>模型目录与文件下载"]
+  ModelManager --> Models[("models/<br/>MLX Whisper 模型目录")]
 
-  Backend --> DB[("SQLite<br/>会话 / 片段 / 设置")]
-  Backend --> Storage[("本地文件存储<br/>uploads / transcripts / exports")]
-
-  Backend --> Export["导出服务<br/>Markdown .md"]
-  Export --> Storage
-
+  Backend --> Transcriber["transcriber.py<br/>ffprobe 时长 / mlx_whisper CLI / JSON 清洗"]
+  Transcriber --> ActiveModel["当前 started 模型<br/>config.json + weights + tokenizer files"]
+  Models --> ActiveModel
+  Transcriber --> Metrics["技术指标<br/>confidence / processing time / segments"]
+  Transcriber --> Storage
   Backend --> Web
         </div>
       </section>
@@ -188,24 +195,35 @@ flowchart TD
   Start["打开 Trisay Lite"] --> ChooseMode{"选择使用方式"}
 
   ChooseMode --> Live["实时会议转录"]
-  ChooseMode --> Upload["上传录音文件"]
+  ChooseMode --> Upload["上传媒体文件"]
+  ChooseMode --> ModelSettings["管理转录模型"]
 
-  Live --> SelectLang["选择语言<br/>Mandarin / Bahasa Indonesia"]
+  ModelSettings --> Catalog["Catalog<br/>查看推荐 MLX 模型"]
+  ModelSettings --> Local["Local<br/>导入本地模型目录"]
+  Catalog --> DownloadModel["从 Hugging Face 下载"]
+  Local --> ImportModel["本地导入到 models/"]
+  DownloadModel --> StartModel["Start 模型"]
+  ImportModel --> StartModel
+  StartModel --> ModelReady{"是否已有模型运行"}
+  ModelReady -->|有| StopCurrent["先 Stop 当前模型"]
+  StopCurrent --> StartModel
+  ModelReady -->|无| Selected["标记为 Selected"]
+
+  Live --> SelectLang["选择语言<br/>Auto / Mandarin / Bahasa Indonesia"]
   SelectLang --> StartRec["点击 Start Transcription"]
-  StartRec --> MicAuth{"浏览器麦克风授权"}
+  StartRec --> NeedModel{"是否有 Selected 模型"}
+  NeedModel -->|无| ModelError["提示先 Start 模型"]
+  NeedModel -->|有| MicAuth{"浏览器麦克风授权"}
 
   MicAuth -->|允许| Capture["采集麦克风音频"]
   MicAuth -->|拒绝| MicError["提示开启麦克风权限"]
 
-  Capture --> Chunk["按 3-5 秒切分音频"]
+  Capture --> Chunk["浏览器按片段发送音频"]
   Chunk --> SendWS["通过 WebSocket 发送到后端"]
-  SendWS --> VadStep["检测是否有人声"]
-
-  VadStep -->|静音| WaitMore["继续等待音频"]
-  WaitMore --> Capture
-
-  VadStep -->|有人声| Transcribe["本地 Whisper v3-turbo 转录"]
-  Transcribe --> ReturnText["返回识别文本"]
+  SendWS --> LiveSnapshot["保存 snapshot webm"]
+  LiveSnapshot --> Transcribe["调用当前 Selected 模型转录"]
+  Transcribe --> CleanText["过滤重复 / 高压缩片段<br/>中文简繁转换 / 时间戳"]
+  CleanText --> ReturnText["返回识别文本"]
   ReturnText --> ShowText["主界面追加显示文本"]
   ShowText --> Continue{"是否继续录音"}
 
@@ -213,16 +231,15 @@ flowchart TD
   Continue -->|暂停| Pause["暂停转录"]
   Continue -->|停止| SaveSession["保存本次会话"]
 
-  Upload --> SelectFile["选择音频文件"]
+  Upload --> SelectFile["选择音频或视频文件"]
   SelectFile --> FileCheck{"文件是否有效"}
 
   FileCheck -->|无效| FileError["提示文件格式或大小错误"]
   FileCheck -->|有效| UploadFile["上传到后端"]
 
-  UploadFile --> Convert["ffmpeg 转码为 16kHz mono wav"]
-  Convert --> Segment["按语音段切片"]
-  Segment --> BatchTranscribe["本地 Whisper v3-turbo 批量转录"]
-  BatchTranscribe --> MergeText["合并完整转录文本"]
+  UploadFile --> SaveUpload["保存到 storage/uploads"]
+  SaveUpload --> BatchTranscribe["mlx_whisper 直接处理媒体文件"]
+  BatchTranscribe --> MergeText["生成带时间戳文本和指标"]
   MergeText --> ShowText
 
   SaveSession --> UserAction{"用户后续操作"}
@@ -232,12 +249,14 @@ flowchart TD
   UserAction --> ExportMd["导出 Markdown"]
   UserAction --> NewSession["新建会话"]
   UserAction --> History["查看历史记录"]
-  UserAction --> Settings["修改语言或主题"]
+  UserAction --> Delete["删除历史并清理关联上传文件"]
+  UserAction --> Settings["修改语言 / 主题 / 模型"]
 
   Copy --> Copied["显示复制成功"]
   ExportMd --> DownloadMD["下载 .md 文件"]
   NewSession --> ChooseMode
   History --> ShowText
+  Delete --> ChooseMode
   Settings --> SaveSettings["保存设置到本地"]
         </div>
       </section>
@@ -246,21 +265,34 @@ flowchart TD
         <h2>3. 用户操作流程图</h2>
         <div class="mermaid">
 flowchart TD
-  OpenApp["打开 Trisay Lite"] --> Home["进入 Dashboard"]
-  Home --> PickLanguage["选择转录语言<br/>Mandarin / Bahasa Indonesia"]
+  OpenApp["Spotlight 或终端打开 Trisay Lite"] --> Launcher["macOS launcher / scripts"]
+  Launcher --> Service{"本地服务是否运行"}
+  Service -->|未运行| StartBackend["启动 FastAPI<br/>写入 storage/logs"]
+  Service -->|已运行| Browser["打开 http://127.0.0.1:8000"]
+  StartBackend --> Browser
+  Browser --> Home["进入 Dashboard"]
+  Home --> PickLanguage["选择转录语言<br/>Auto / Mandarin / Bahasa Indonesia"]
   PickLanguage --> PickMode{"选择任务"}
 
   PickMode --> LiveMode["实时会议转录"]
-  PickMode --> UploadMode["上传录音文件"]
+  PickMode --> UploadMode["上传媒体文件"]
+  PickMode --> SettingsMode["Settings"]
+
+  SettingsMode --> ModelTab["Model Management"]
+  ModelTab --> CatalogTab["Catalog 下载模型"]
+  ModelTab --> LocalTab["Local 导入模型目录"]
+  CatalogTab --> StartSelected["Start / Stop / Delete 模型"]
+  LocalTab --> StartSelected
 
   LiveMode --> StartButton["点击 Start Transcription"]
   StartButton --> Permission{"授权麦克风"}
   Permission -->|允许| LiveText["查看实时转录文本"]
   Permission -->|拒绝| PermissionHelp["查看权限提示"]
 
-  UploadMode --> ChooseFile["选择本地音频文件"]
+  UploadMode --> ChooseFile["选择本地音频或视频文件"]
   ChooseFile --> Uploading["等待上传和识别"]
-  Uploading --> UploadedText["查看完整转录文本"]
+  Uploading --> MediaInfo["显示 Media Info<br/>confidence / process time"]
+  MediaInfo --> UploadedText["查看带时间戳转录文本"]
 
   LiveText --> Review["检查和阅读文本"]
   UploadedText --> Review
@@ -278,7 +310,7 @@ flowchart TD
   PauseLive --> LiveText
   StopLive --> Saved["保存到历史记录"]
   NewMeeting --> PickLanguage
-  OpenSettings --> ChangePrefs["修改语言 / 主题"]
+  OpenSettings --> ChangePrefs["修改语言 / 主题 / 模型"]
   ChangePrefs --> Home
         </div>
       </section>
@@ -294,10 +326,13 @@ stateDiagram-v2
   Paused: 已暂停
   Processing: 识别中
   Uploading: 上传中
+  ModelStopped: 无可用模型
   Completed: 已完成
   Error: 出错
 
-  Idle --> Recording: Start Transcription
+  Idle --> ModelStopped: Start Transcription 但未 Start 模型
+  ModelStopped --> Idle: Start 模型后返回
+  Idle --> Recording: Start Transcription 且模型已 Selected
   Recording --> Processing: 收到有效语音片段
   Processing --> Recording: 返回识别文本
   Recording --> Paused: Pause
@@ -305,17 +340,17 @@ stateDiagram-v2
   Recording --> Completed: Stop
   Paused --> Completed: Stop
 
-  Idle --> Uploading: Upload Audio
+  Idle --> Uploading: Upload Media
   Uploading --> Processing: 文件上传完成
   Processing --> Completed: 文件识别完成
 
   Recording --> Error: 麦克风 / WebSocket 错误
   Uploading --> Error: 文件无效 / 上传失败
-  Processing --> Error: 模型识别失败
+  Processing --> Error: 模型识别失败 / 超时
   Error --> Idle: Dismiss / New Session
 
   Completed --> Idle: New Session
-  Completed --> Completed: Copy / Export / View History
+  Completed --> Completed: Copy / Export / View History / Delete
         </div>
       </section>
 
@@ -327,45 +362,74 @@ sequenceDiagram
   actor User as 用户
   participant Web as Vue 前端
   participant API as FastAPI 后端
-  participant Audio as 音频处理服务
-  participant VAD as Silero VAD
-  participant ASR as mlx-whisper
-  participant DB as SQLite / 本地存储
+  participant Model as Model Manager
+  participant ASR as mlx_whisper CLI
+  participant Store as SQLite / storage / models
+
+  User->>Web: 进入 Settings / Model Management
+  Web->>API: GET /models 或 /models/local
+  API->>Model: 读取 catalog、本地模型和 selected_model_id
+  Model->>Store: 读取 models/ 与 storage/model_settings.json
+  Store-->>Model: 返回模型状态
+  Model-->>API: 返回 installed / selected / download_job
+  API-->>Web: 显示模型列表
+
+  alt 下载 Hugging Face 模型
+    User->>Web: 点击 Download
+    Web->>API: POST /models/{model_id}/download
+    API->>Model: 后台下载到 models/.downloading
+    loop 自动刷新
+      Web->>API: GET /models
+      API-->>Web: 返回进度或错误
+    end
+  else 导入本地模型
+    User->>Web: 选择本地模型目录
+    Web->>API: POST /models/local/import
+    API->>Model: 校验 config.json 并复制到 models/
+    Model-->>API: 导入完成
+    API-->>Web: 刷新 Local 模型列表
+  end
+
+  User->>Web: 点击 Start 模型
+  Web->>API: POST /models/{model_id}/select
+  API->>Model: 保存 selected_model_id
+  Model->>Store: 写入 model_settings.json
+  API-->>Web: 显示 Selected
 
   User->>Web: 选择语言并点击开始转录
   Web->>User: 请求麦克风权限
   User-->>Web: 允许麦克风
   Web->>API: 建立 WebSocket 会话
-  API->>DB: 创建转录会话
-  DB-->>API: 返回 session_id
+  API->>Store: 创建 session
+  Store-->>API: 返回 session_id
   API-->>Web: 会话已建立
 
-  loop 每 3-5 秒音频片段
+  loop 浏览器录音片段
     Web->>API: 发送音频 chunk
-    API->>Audio: 转码 / 标准化音频
-    Audio-->>API: 16kHz mono 音频
-    API->>VAD: 检测是否有人声
-    VAD-->>API: speech / silence
-    alt 有人声
-      API->>ASR: 调用 Whisper large-v3-turbo
-      ASR-->>API: 返回转录文本
-      API->>DB: 保存转录片段
+    API->>Store: 保存 snapshot webm
+    API->>Model: 获取当前 Selected 模型目录
+    Model-->>API: 返回 models/{model_id}
+    API->>ASR: 调用 mlx_whisper 输出 JSON
+    ASR-->>API: 返回 segments / metrics
+    API->>API: 清洗重复片段 / 时间戳 / 简体转换
+    alt 有转录文本
+      API->>Store: 保存 live.json
       API-->>Web: 推送 transcript segment
       Web-->>User: 主界面追加显示文本
-    else 静音
-      API-->>Web: 保持连接，不追加文本
+    else 无新增文本
+      API-->>Web: silence / unchanged / busy
     end
   end
 
   User->>Web: 点击停止
   Web->>API: 关闭转录会话
-  API->>DB: 保存完整 transcript
+  API->>Store: 保存完整 transcript
   API-->>Web: 返回完成状态
 
   User->>Web: 点击导出 Markdown
   Web->>API: 请求导出 .md
-  API->>DB: 读取 transcript
-  API->>DB: 保存导出文件记录
+  API->>Store: 读取 transcript 和 metrics
+  API->>Store: 写入 exports/{session_id}.md
   API-->>Web: 返回下载文件
   Web-->>User: 下载 .md
         </div>

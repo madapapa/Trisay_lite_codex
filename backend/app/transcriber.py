@@ -6,7 +6,8 @@ import sys
 import time
 from pathlib import Path
 
-from .paths import MODEL_DIR, TRANSCRIPTS_DIR
+from .model_manager import get_active_model_dir
+from .paths import TRANSCRIPTS_DIR
 
 try:
     from opencc import OpenCC
@@ -19,7 +20,12 @@ class TranscriptionError(RuntimeError):
 
 
 PUNCTUATION_PROMPTS = {
-    "auto": "Transcribe each utterance in its original spoken language. Keep English as English and Chinese as Chinese. Use natural punctuation.",
+    "auto": (
+        "Transcribe exactly as spoken. Do NOT translate any word into another language. "
+        "Mixed Chinese-English speech is common; keep every word in its original spoken language. "
+        "Chinese words must stay in Chinese characters. English words must stay in English. "
+        "Use natural punctuation for each language."
+    ),
     "zh": "以下是普通话转写文本。请使用自然的中文标点符号，例如：你好，我想咨询一个问题，可以吗？",
     "id": "Transkrip Bahasa Indonesia dengan tanda baca alami. Contoh: Halo, saya ingin bertanya. Apakah bisa?",
 }
@@ -59,7 +65,7 @@ def format_timestamp(seconds: object) -> str:
 
 
 def normalize_transcript_text(text: str, language: str | None) -> str:
-    if language in {"auto", "zh"} and ZH_SIMPLIFIER is not None:
+    if language == "zh" and ZH_SIMPLIFIER is not None:
         return ZH_SIMPLIFIER.convert(text)
     return text
 
@@ -174,11 +180,15 @@ def default_timeout_seconds(audio_path: Path) -> int:
     return min(1800, max(300, int(duration * 0.35) + 180))
 
 
-def transcribe_with_mlx(audio_path: Path, *, session_id: str, language: str, timeout_seconds: int | None = None) -> tuple[str, Path]:
-    if not MODEL_DIR.exists():
-        raise TranscriptionError(f"Model directory not found: {MODEL_DIR}")
+def transcribe_with_mlx(audio_path: Path, *, session_id: str, language: str, timeout_seconds: int | None = None, output_dir_override: Path | None = None) -> tuple[str, Path]:
+    try:
+        model_dir = get_active_model_dir()
+    except FileNotFoundError as error:
+        raise TranscriptionError(str(error)) from error
+    if not model_dir.exists():
+        raise TranscriptionError(f"Model directory not found: {model_dir}")
 
-    output_dir = TRANSCRIPTS_DIR / session_id
+    output_dir = output_dir_override if output_dir_override is not None else TRANSCRIPTS_DIR / session_id
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_timeout_seconds = timeout_seconds or default_timeout_seconds(audio_path)
     started_at = time.perf_counter()
@@ -187,7 +197,7 @@ def transcribe_with_mlx(audio_path: Path, *, session_id: str, language: str, tim
         str(Path(sys.executable).parent / "mlx_whisper"),
         str(audio_path),
         "--model",
-        str(MODEL_DIR),
+        str(model_dir),
         "--output-dir",
         str(output_dir),
         "--output-format",
