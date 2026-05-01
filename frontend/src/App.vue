@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   CheckCircle2,
   Copy,
@@ -21,7 +21,9 @@ import {
 
 type LanguageCode = "auto" | "zh" | "id";
 type AppView = "dashboard" | "settings";
+type ModelTab = "catalog" | "local";
 type SessionStatus = "idle" | "recording" | "paused" | "processing" | "completed" | "error";
+type ModelStatus = "idle" | "queued" | "downloading" | "completed" | "error";
 
 interface TranscriptionMetrics {
   processing_seconds?: number | null;
@@ -64,10 +66,69 @@ interface SessionDetail extends SessionSummary {
   error?: string | null;
 }
 
+interface ModelDownloadJob {
+  model_id: string;
+  status: ModelStatus;
+  progress: number;
+  downloaded_bytes: number;
+  total_bytes: number;
+  current_file?: string | null;
+  message?: string | null;
+  started_at: number;
+  updated_at: number;
+}
+
+interface ModelItem {
+  id: string;
+  name: string;
+  repo_id: string;
+  huggingface_url: string;
+  description: string;
+  recommended_on_apple_silicon: boolean;
+  local_dir: string;
+  installed: boolean;
+  selected: boolean;
+  recommended: boolean;
+  download_job?: ModelDownloadJob | null;
+}
+
+interface ModelEntry {
+  id: string;
+  name: string;
+  description: string;
+  installed: boolean;
+  selected: boolean;
+  recommended?: boolean;
+  local_dir: string;
+  huggingface_url?: string | null;
+  download_job?: ModelDownloadJob | null;
+  source?: string;
+}
+
+interface MachineInfo {
+  system: string;
+  machine: string;
+  apple_silicon: boolean;
+  recommended_family: string;
+}
+
+interface ModelsResponse {
+  machine: MachineInfo;
+  selected_model_id: string | null;
+  models: ModelItem[];
+  downloads: ModelDownloadJob[];
+}
+
+interface LocalModelsResponse {
+  selected_model_id: string | null;
+  models: ModelEntry[];
+}
+
 const API_BASE = "http://127.0.0.1:8000";
 const WS_BASE = API_BASE.replace(/^http/, "ws");
 
 const currentView = ref<AppView>("dashboard");
+const modelTab = ref<ModelTab>("catalog");
 const language = ref<LanguageCode>("auto");
 const theme = ref<"light" | "dark">("light");
 const status = ref<SessionStatus>("idle");
@@ -87,6 +148,17 @@ const recentSessions = ref<SessionSummary[]>([]);
 const sessionsError = ref("");
 const isLoadingSessions = ref(false);
 const transcriptionMetrics = ref<TranscriptionMetrics | null>(null);
+const modelItems = ref<ModelItem[]>([]);
+const localModelItems = ref<ModelEntry[]>([]);
+const machineInfo = ref<MachineInfo | null>(null);
+const selectedModelId = ref<string | null>("");
+const modelsError = ref("");
+const isLoadingModels = ref(false);
+const modelRefreshTimer = ref<number | null>(null);
+const localModelUploadInput = ref<HTMLInputElement | null>(null);
+const isImportingLocalModel = ref(false);
+const localImportProgress = ref(0);
+const localImportStatus = ref("");
 
 const languageLabel = computed(() => {
   const labels: Record<LanguageCode, string> = {
@@ -153,6 +225,16 @@ const metricsTooltip = computed(() => {
     .filter(Boolean)
     .join(" · ");
 });
+const modelRecommendationText = computed(() => {
+  if (!machineInfo.value) return "Loading machine info...";
+  if (machineInfo.value.apple_silicon) {
+    return `Apple Silicon detected (${machineInfo.value.machine}). MLX models are recommended.`;
+  }
+  return `This machine is ${machineInfo.value.machine}. MLX models are designed for Apple Silicon.`;
+});
+const activeModel = computed(() => modelItems.value.find((model) => model.selected) || null);
+const anyModelDownloading = computed(() => modelItems.value.some((model) => model.download_job?.status === "queued" || model.download_job?.status === "downloading"));
+const visibleModels = computed(() => (modelTab.value === "catalog" ? modelItems.value : localModelItems.value));
 
 function showToast(message: string) {
   toastMessage.value = message;
@@ -197,6 +279,205 @@ async function loadSessions() {
     sessionsError.value = error instanceof Error ? error.message : "Unable to load history.";
   } finally {
     isLoadingSessions.value = false;
+  }
+}
+
+async function loadModels() {
+  isLoadingModels.value = true;
+  modelsError.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/models`);
+    if (!response.ok) {
+      throw new Error("Unable to load models.");
+    }
+    const data = (await response.json()) as ModelsResponse;
+    machineInfo.value = data.machine;
+    selectedModelId.value = data.selected_model_id;
+    modelItems.value = data.models;
+  } catch (error) {
+    modelsError.value = error instanceof Error ? error.message : "Unable to load models.";
+  } finally {
+    isLoadingModels.value = false;
+    refreshModelPolling();
+  }
+}
+
+async function refreshCurrentModelTab() {
+  if (modelTab.value === "catalog") {
+    await loadModels();
+  } else {
+    await loadLocalModels();
+  }
+}
+
+async function loadLocalModels() {
+  isLoadingModels.value = true;
+  modelsError.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/models/local`);
+    if (!response.ok) {
+      throw new Error("Unable to load local models.");
+    }
+    const data = (await response.json()) as LocalModelsResponse;
+    selectedModelId.value = data.selected_model_id;
+    localModelItems.value = data.models;
+  } catch (error) {
+    modelsError.value = error instanceof Error ? error.message : "Unable to load local models.";
+  } finally {
+    isLoadingModels.value = false;
+  }
+}
+
+async function downloadModel(model: ModelEntry) {
+  modelsError.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/models/${model.id}/download`, { method: "POST" });
+    if (!response.ok) {
+      throw new Error("Unable to start model download.");
+    }
+    await loadModels();
+  } catch (error) {
+    modelsError.value = error instanceof Error ? error.message : "Unable to start model download.";
+  }
+}
+
+async function startModel(model: ModelEntry) {
+  modelsError.value = "";
+  if (selectedModelId.value && selectedModelId.value !== model.id) {
+    window.alert("Please stop the currently selected model before starting another model.");
+    return;
+  }
+
+  try {
+    const response = await fetch(`${API_BASE}/models/${model.id}/select`, { method: "POST" });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null);
+      throw new Error(detail?.detail || "Unable to select model.");
+    }
+    selectedModelId.value = model.id;
+    await refreshCurrentModelTab();
+    showToast(`Started ${model.name}`);
+  } catch (error) {
+    modelsError.value = error instanceof Error ? error.message : "Unable to start model.";
+  }
+}
+
+async function stopModel(model: ModelEntry) {
+  modelsError.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/models/${model.id}/stop`, { method: "POST" });
+    if (!response.ok) {
+      throw new Error("Unable to stop model.");
+    }
+    selectedModelId.value = null;
+    await refreshCurrentModelTab();
+    showToast(`Stopped ${model.name}`);
+  } catch (error) {
+    modelsError.value = error instanceof Error ? error.message : "Unable to stop model.";
+  }
+}
+
+async function deleteModel(model: ModelEntry) {
+  const confirmed = window.confirm(`Delete the local files for "${model.name}"?`);
+  if (!confirmed) return;
+
+  modelsError.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/models/${model.id}`, { method: "DELETE" });
+    if (!response.ok) {
+      throw new Error("Unable to delete model.");
+    }
+    if (selectedModelId.value === model.id) {
+      selectedModelId.value = "";
+    }
+    await refreshCurrentModelTab();
+    showToast("Model deleted");
+  } catch (error) {
+    modelsError.value = error instanceof Error ? error.message : "Unable to delete model.";
+  }
+}
+
+async function importLocalModel(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  if (!files.length) return;
+
+  const firstPath = files[0].webkitRelativePath || files[0].name;
+  const modelId = firstPath.split("/")[0] || files[0].name;
+  const body = new FormData();
+  body.append("model_id", modelId);
+  for (const file of files) {
+    const relativePath = file.webkitRelativePath || file.name;
+    const rel = relativePath.split("/").slice(1).join("/");
+    body.append("files", file, rel || file.name);
+  }
+
+  modelsError.value = "";
+  isImportingLocalModel.value = true;
+  localImportProgress.value = 0;
+  localImportStatus.value = `Importing ${modelId}`;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open("POST", `${API_BASE}/models/local/import`);
+
+      request.upload.onprogress = (progressEvent) => {
+        if (!progressEvent.lengthComputable) {
+          localImportStatus.value = `Importing ${modelId}`;
+          return;
+        }
+        localImportProgress.value = Math.min(99, Math.round((progressEvent.loaded / progressEvent.total) * 100));
+      };
+
+      request.onload = () => {
+        if (request.status >= 200 && request.status < 300) {
+          localImportProgress.value = 100;
+          resolve();
+          return;
+        }
+        try {
+          const payload = JSON.parse(request.responseText) as { detail?: string };
+          reject(new Error(payload.detail || "Unable to import local model."));
+        } catch {
+          reject(new Error("Unable to import local model."));
+        }
+      };
+
+      request.onerror = () => reject(new Error("Unable to import local model."));
+      request.send(body);
+    });
+    await loadLocalModels();
+    showToast("Local model imported");
+  } catch (error) {
+    modelsError.value = error instanceof Error ? error.message : "Unable to import local model.";
+  } finally {
+    isImportingLocalModel.value = false;
+    window.setTimeout(() => {
+      localImportProgress.value = 0;
+      localImportStatus.value = "";
+    }, 1200);
+    input.value = "";
+  }
+}
+
+function refreshModelPolling() {
+  if (modelRefreshTimer.value !== null) {
+    window.clearInterval(modelRefreshTimer.value);
+    modelRefreshTimer.value = null;
+  }
+  if (anyModelDownloading.value) {
+    modelRefreshTimer.value = window.setInterval(() => {
+      void loadModels();
+    }, 2000);
+  }
+}
+
+function switchModelTab(tab: ModelTab) {
+  modelTab.value = tab;
+  if (tab === "catalog") {
+    void loadModels();
+  } else {
+    void loadLocalModels();
   }
 }
 
@@ -439,6 +720,15 @@ function triggerDownload(blob: Blob, filename: string) {
 
 onMounted(() => {
   void loadSessions();
+  void loadModels();
+  void loadLocalModels();
+  refreshModelPolling();
+});
+
+onUnmounted(() => {
+  if (modelRefreshTimer.value !== null) {
+    window.clearInterval(modelRefreshTimer.value);
+  }
 });
 </script>
 
@@ -630,6 +920,81 @@ onMounted(() => {
             <span>Bahasa Indonesia</span>
             <input v-model="language" type="radio" value="id" />
           </label>
+        </section>
+
+        <section class="settings-card">
+          <h2><Download :size="24" /> Model Management</h2>
+          <p>{{ modelRecommendationText }}</p>
+          <div class="model-machine-line" v-if="machineInfo">
+            <span>System: {{ machineInfo.system }}</span>
+            <span>Chip: {{ machineInfo.machine }}</span>
+            <span v-if="machineInfo.apple_silicon">Apple Silicon ready</span>
+          </div>
+          <p v-if="modelsError" class="sidebar-error">{{ modelsError }}</p>
+          <div class="model-tabs" role="tablist" aria-label="Model sources">
+            <button class="model-tab" :class="{ active: modelTab === 'catalog' }" @click="switchModelTab('catalog')">
+              Catalog
+            </button>
+            <button class="model-tab" :class="{ active: modelTab === 'local' }" @click="switchModelTab('local')">
+              Local
+            </button>
+          </div>
+          <p v-if="modelTab === 'catalog' && anyModelDownloading" class="model-progress-note">Download in progress. The list refreshes automatically.</p>
+          <p v-if="modelTab === 'local'" class="model-progress-note">Choose a local model folder. The browser will ask for permission, then Trisay Lite imports it into the local model library.</p>
+          <div class="model-list">
+            <article v-for="model in visibleModels" :key="model.id" class="model-row" :class="{ selected: model.selected }">
+              <div class="model-row-main">
+                <div class="model-row-heading">
+                  <strong>{{ model.name }}</strong>
+                  <span v-if="model.recommended" class="model-badge">Recommended</span>
+                  <span v-if="model.installed" class="model-badge installed">Installed</span>
+                  <span v-if="model.selected" class="model-badge selected">Selected</span>
+                </div>
+                <p>{{ model.description }}</p>
+                <div v-if="modelTab === 'catalog' && model.download_job && (model.download_job.status === 'queued' || model.download_job.status === 'downloading')" class="model-progress">
+                  <div class="model-progress-bar">
+                    <span :style="{ width: `${Math.max(3, model.download_job.progress)}%` }"></span>
+                  </div>
+                  <small>
+                    {{ model.download_job.current_file || "Preparing download" }}
+                    <template v-if="model.download_job.total_bytes > 0">
+                      · {{ model.download_job.progress.toFixed(0) }}%
+                    </template>
+                  </small>
+                </div>
+                <div v-if="modelTab === 'catalog' && model.download_job?.status === 'error'" class="model-download-error">
+                  <strong>Download failed</strong>
+                  <span>{{ model.download_job.message || "Unable to download this model." }}</span>
+                </div>
+                <a v-if="modelTab === 'catalog'" class="model-link" :href="model.huggingface_url || undefined" target="_blank" rel="noreferrer">Hugging Face download page</a>
+              </div>
+              <div class="model-row-actions">
+                <button v-if="modelTab === 'catalog' && !model.installed" class="secondary-button" :disabled="model.download_job?.status === 'queued' || model.download_job?.status === 'downloading'" @click="downloadModel(model)">
+                  {{ model.download_job?.status === "error" ? "Retry download" : "Download" }}
+                </button>
+                <button v-if="model.installed" class="primary-button" :disabled="model.selected" @click="startModel(model)">
+                  Start
+                </button>
+                <button v-if="model.installed" class="secondary-button" :disabled="!model.selected" @click="stopModel(model)">
+                  Stop
+                </button>
+                <button v-if="model.installed" class="danger-button" @click="deleteModel(model)">
+                  Delete
+                </button>
+              </div>
+            </article>
+          </div>
+          <label v-if="modelTab === 'local' && !isImportingLocalModel" class="upload-button model-import-button">
+            Choose local model folder
+            <input ref="localModelUploadInput" type="file" webkitdirectory directory multiple @change="importLocalModel" />
+          </label>
+          <div v-if="modelTab === 'local' && (isImportingLocalModel || localImportStatus)" class="model-progress local-import-progress">
+            <div class="model-progress-bar">
+              <span :style="{ width: `${Math.max(3, localImportProgress)}%` }"></span>
+            </div>
+            <small>{{ localImportStatus || "Import complete" }} · {{ localImportProgress }}%</small>
+          </div>
+          <p v-if="isLoadingModels">Loading models...</p>
         </section>
 
         <section class="settings-card">

@@ -2,6 +2,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = PROJECT_ROOT / "models" / "whisper-large-v3-turbo"
+FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 STORAGE_DIR = PROJECT_ROOT / "storage"
 UPLOADS_DIR = STORAGE_DIR / "uploads"
 TRANSCRIPTS_DIR = STORAGE_DIR / "transcripts"

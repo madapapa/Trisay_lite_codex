@@ -8,9 +8,11 @@ import aiofiles
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .database import create_session, delete_session, get_session, init_db, list_sessions, update_session
-from .paths import EXPORTS_DIR, STORAGE_DIR, TRANSCRIPTS_DIR, UPLOADS_DIR, ensure_runtime_dirs
+from .model_manager import delete_model, get_local_models_state, get_model_catalog_state, import_local_model, select_model, start_model_download, stop_model
+from .paths import EXPORTS_DIR, FRONTEND_DIST_DIR, STORAGE_DIR, TRANSCRIPTS_DIR, UPLOADS_DIR, ensure_runtime_dirs
 from .transcriber import TranscriptionError, calculate_transcript_metrics, clean_transcript_payload, transcribe_with_mlx
 
 SUPPORTED_LANGUAGES = {"auto", "zh", "id"}
@@ -37,8 +39,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/")
-def root() -> dict[str, object]:
+@app.get("/", response_model=None)
+def root():
+    index_path = FRONTEND_DIST_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+
     return {
         "name": "Trisay Lite API",
         "status": "running",
@@ -50,6 +56,16 @@ def root() -> dict[str, object]:
 @app.get("/sessions")
 def sessions() -> dict[str, object]:
     return {"items": list_sessions()}
+
+
+@app.get("/models")
+def models() -> dict[str, object]:
+    return get_model_catalog_state()
+
+
+@app.get("/models/local")
+def local_models() -> dict[str, object]:
+    return get_local_models_state()
 
 
 def ensure_transcript_dir(session_id: str) -> Path:
@@ -84,6 +100,50 @@ def delete_directory_if_safe(path: Path, allowed_parent: Path) -> bool:
 
     shutil.rmtree(path)
     return True
+
+
+@app.post("/models/{model_id}/download")
+def download_model(model_id: str) -> dict[str, object]:
+    try:
+        return start_model_download(model_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+
+@app.post("/models/{model_id}/select")
+def choose_model(model_id: str) -> dict[str, object]:
+    try:
+        return select_model(model_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Model not found")
+    except FileNotFoundError:
+        raise HTTPException(status_code=409, detail="Model is not installed")
+
+
+@app.post("/models/{model_id}/stop")
+def stop_active_model(model_id: str) -> dict[str, object]:
+    return stop_model(model_id)
+
+
+@app.delete("/models/{model_id}")
+def remove_model(model_id: str) -> dict[str, object]:
+    try:
+        return delete_model(model_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+
+@app.post("/models/local/import")
+async def import_model_directory(model_id: str = Form(...), files: list[UploadFile] = File(...)) -> dict[str, object]:
+    try:
+        payload: list[tuple[str, bytes]] = []
+        for file in files:
+            relative_path = file.filename or ""
+            content = await file.read()
+            payload.append((relative_path, content))
+        return import_local_model(model_id, payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 def read_transcript_payload(transcript_path_value: object) -> tuple[str, dict[str, object] | None, dict[str, object] | None]:
@@ -161,6 +221,10 @@ async def live_transcription(websocket: WebSocket, language: str = Query(...)) -
     live_transcript_path = transcript_dir / "live.json"
     latest_transcript = ""
     snapshot_index = 0
+    # Prevent concurrent mlx_whisper calls for the same session.
+    # When a chunk is already being transcribed, new chunks are skipped
+    # so the WebSocket receive loop never stalls.
+    transcription_lock = asyncio.Lock()
 
     create_session(
         session_id=session_id,
@@ -183,20 +247,34 @@ async def live_transcription(websocket: WebSocket, language: str = Query(...)) -
             async with aiofiles.open(snapshot_path, "wb") as output:
                 await output.write(audio_bytes)
 
-            try:
-                transcript_text, _ = await asyncio.to_thread(
-                    transcribe_with_mlx,
-                    snapshot_path,
-                    session_id=session_id,
-                    language=language,
-                    timeout_seconds=120,
-                )
-            except TranscriptionError as error:
+            # Skip this chunk if a previous transcription is still running.
+            # This keeps the receive loop alive and avoids WebSocket back-pressure.
+            if transcription_lock.locked():
                 try:
-                    await websocket.send_json({"type": "error", "message": str(error)})
+                    await websocket.send_json({"type": "busy"})
                 except WebSocketDisconnect:
                     break
                 continue
+
+            async with transcription_lock:
+                # Use a per-snapshot output subdirectory so JSON files from
+                # different snapshots never overwrite or shadow each other.
+                snapshot_output_dir = transcript_dir / f"snap-{snapshot_index:04d}"
+                try:
+                    transcript_text, _ = await asyncio.to_thread(
+                        transcribe_with_mlx,
+                        snapshot_path,
+                        session_id=session_id,
+                        language=language,
+                        timeout_seconds=120,
+                        output_dir_override=snapshot_output_dir,
+                    )
+                except TranscriptionError as error:
+                    try:
+                        await websocket.send_json({"type": "error", "message": str(error)})
+                    except WebSocketDisconnect:
+                        break
+                    continue
 
             if not transcript_text:
                 try:
@@ -337,3 +415,7 @@ def export_markdown(session_id: str) -> FileResponse:
     export_path = EXPORTS_DIR / f"{session_id}.md"
     export_path.write_text(markdown, encoding="utf-8")
     return FileResponse(export_path, media_type="text/markdown", filename=export_path.name)
+
+
+if FRONTEND_DIST_DIR.exists():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST_DIR, html=True), name="frontend")

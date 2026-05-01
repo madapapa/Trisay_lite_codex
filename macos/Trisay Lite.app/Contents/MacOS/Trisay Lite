@@ -1,0 +1,17 @@
+#!/bin/zsh
+set -euo pipefail
+
+PROJECT_ROOT="/Users/vtl/project/codex/trisay_lite"
+URL="http://127.0.0.1:8000"
+LOG_DIR="$PROJECT_ROOT/storage/logs"
+APP_LOG="$LOG_DIR/trisay_lite_launcher.log"
+
+mkdir -p "$LOG_DIR"
+
+{
+  date
+  "$PROJECT_ROOT/scripts/open_trisay.sh"
+} >> "$APP_LOG" 2>&1 || {
+  osascript -e 'display alert "Trisay Lite failed to start" message "Check storage/logs/trisay_lite_launcher.log for details."'
+  exit 1
+}
