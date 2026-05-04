@@ -48,7 +48,7 @@ MODEL_CATALOG: list[ModelSpec] = [
         name="Whisper Large V3 Turbo",
         repo_id="mlx-community/whisper-large-v3-turbo",
         huggingface_url="https://huggingface.co/mlx-community/whisper-large-v3-turbo",
-        description="Fast MLX build of Whisper large-v3-turbo. Good default for Apple Silicon.",
+        description="Fast MLX build of Whisper large-v3-turbo. Recommended for live transcription on Apple Silicon.",
         recommended_on_apple_silicon=True,
     ),
     ModelSpec(
@@ -56,7 +56,7 @@ MODEL_CATALOG: list[ModelSpec] = [
         name="Whisper Large V3",
         repo_id="mlx-community/whisper-large-v3-mlx",
         huggingface_url="https://huggingface.co/mlx-community/whisper-large-v3-mlx",
-        description="Full Whisper large-v3 in MLX format. Slower, but usually more accurate.",
+        description="Full Whisper large-v3 in MLX format. Recommended for uploaded media and higher accuracy.",
         recommended_on_apple_silicon=True,
     ),
 ]

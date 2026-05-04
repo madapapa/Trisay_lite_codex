@@ -8,3 +8,4 @@ test/
 .playwright-cli/
 .DS_Store
 design/
+trisay_lite.code-workspace
