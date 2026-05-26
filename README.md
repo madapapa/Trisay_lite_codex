@@ -1,282 +1,289 @@
 # Trisay Lite
 
-Trisay Lite 是一个面向会议场景的本地语音转录 Web 应用方案。目标是支持中文普通话和 Bahasa Indonesia，提供实时麦克风转录、上传录音文件转录、复制全文、导出 Markdown、历史记录和基础设置能力。
+Trisay Lite 是一个本地运行的语音转录 Web 应用。它面向会议、通话和本地媒体文件转录，优先适配 Apple Silicon Mac，通过本地 MLX Whisper 模型完成识别，不把音频上传到云端服务。
 
-本方案优先使用本地模型，适配 Apple Silicon 设备：
+当前功能包括：
 
-- 前端：Vue 3 + Vite + Tailwind CSS + Pinia + Vue Router
-- 后端：FastAPI + WebSocket
-- 本地模型：Whisper large-v3-turbo
-- Apple Silicon 推理：mlx-whisper
-- 音频处理：ffmpeg
-- 静音检测：Silero VAD
-- 本地存储：SQLite + 本地文件目录
+- 实时麦克风转录
+- 上传音频或视频文件转录
+- Auto / Mandarin / Bahasa Indonesia 语言模式
+- 带时间戳的转录文本
+- 中文简繁转换为简体
+- 重复片段和异常压缩片段过滤
+- 转录置信度、处理时间等 Media Info 指标
+- 历史记录查看、删除、复制全文、导出 Markdown
+- 模型管理：下载、导入本地模型、Start / Stop / Delete
+- Light / Dark 主题
+- FastAPI 托管生产前端
+- macOS `.app` 启动器和 shell 启停脚本
 
-## 1. 技术架构图
+## 技术栈
+
+- Frontend: Vue 3 + Vite + TypeScript + lucide-vue-next
+- Backend: FastAPI + WebSocket + SQLite
+- Transcription: `mlx-whisper` CLI
+- Model runtime: MLX models for Apple Silicon
+- Local storage: SQLite + local file directories
+- Packaging helper: macOS app launcher + shell scripts
+
+## 目录结构
+
+```text
+trisay_lite/
+  backend/
+    app/
+      main.py             # FastAPI API, WebSocket, upload, export, static frontend
+      transcriber.py      # mlx_whisper invocation, cleanup, timestamps, metrics
+      model_manager.py    # model catalog, download, local import, start/stop/delete
+      database.py         # SQLite session storage
+      paths.py            # project paths
+    pyproject.toml
+
+  frontend/
+    src/
+      App.vue             # main application UI and client state
+      style.css           # responsive light/dark UI styles
+      main.ts
+    package.json
+    dist/                 # production build, ignored by git
+
+  scripts/
+    start_trisay.sh       # start local backend on 127.0.0.1:8000
+    stop_trisay.sh        # stop local backend on port 8000
+    open_trisay.sh        # start then open browser
+
+  macos/
+    Trisay Lite.app/      # local app launcher
+
+  models/                 # local Whisper models, ignored by git
+  storage/                # SQLite, uploads, transcripts, exports, logs; ignored by git
+  test/                   # local test media; ignored by git
+  trisay_lite_architecture.html
+```
+
+## 架构
 
 ```mermaid
 flowchart LR
-  User["用户浏览器<br/>Chrome / Safari"] --> Web["Vue 3 + Vite 前端"]
+  User["User browser"] --> Frontend["Vue frontend"]
+  Frontend --> Live["WebSocket live transcription"]
+  Frontend --> Upload["HTTP upload transcription"]
+  Frontend --> ModelsUI["Model Management UI"]
+  Frontend --> History["History / Copy / Export"]
 
-  Web --> UI["界面组件<br/>Dashboard / Settings / Upload / Export"]
-  Web --> Audio["浏览器音频采集<br/>MediaRecorder / AudioWorklet"]
-  Web --> Store["Pinia 状态管理<br/>当前会话 / 转录文本 / 设置"]
+  Live --> API["FastAPI backend"]
+  Upload --> API
+  ModelsUI --> API
+  History --> API
 
-  Audio --> WS["WebSocket<br/>实时音频流"]
-  UI --> API["HTTP API<br/>上传 / 历史 / 导出 / 设置"]
+  API --> DB[("SQLite sessions")]
+  API --> Storage[("storage uploads / transcripts / exports")]
+  API --> ModelManager["model_manager.py"]
+  ModelManager --> HF["Hugging Face catalog download"]
+  ModelManager --> Models[("models/ MLX Whisper models")]
 
-  WS --> Backend["FastAPI 后端"]
-  API --> Backend
-
-  Backend --> Session["会话管理<br/>Session Manager"]
-  Backend --> AudioService["音频处理<br/>ffmpeg 转码 / 切片"]
-  Backend --> VAD["语音活动检测<br/>Silero VAD"]
-  Backend --> ASR["本地语音识别<br/>mlx-whisper"]
-  ASR --> Model["Whisper large-v3-turbo<br/>Apple Silicon 本地模型"]
-
-  Backend --> DB[("SQLite<br/>会话 / 片段 / 设置")]
-  Backend --> Storage[("本地文件存储<br/>uploads / transcripts / exports")]
-
-  Backend --> Export["导出服务<br/>Markdown .md"]
-  Export --> Storage
-
-  Backend --> Web
+  API --> Transcriber["transcriber.py"]
+  Transcriber --> MLX["mlx_whisper CLI"]
+  MLX --> Models
+  Transcriber --> Storage
 ```
 
-## 2. 业务系统流程图
+## 环境要求
 
-```mermaid
-flowchart TD
-  Start["打开 Trisay Lite"] --> ChooseMode{"选择使用方式"}
+Recommended:
 
-  ChooseMode --> Live["实时会议转录"]
-  ChooseMode --> Upload["上传录音文件"]
+- Apple Silicon Mac: M2 / M3 / M4
+- Python 3.12+
+- Node.js 20+
+- `ffmpeg` / `ffprobe` available in PATH
+- Local MLX Whisper model under `models/`
 
-  Live --> SelectLang["选择语言<br/>Mandarin / Bahasa Indonesia"]
-  SelectLang --> StartRec["点击 Start Transcription"]
-  StartRec --> MicAuth{"浏览器麦克风授权"}
+Backend Python dependencies are declared in:
 
-  MicAuth -->|允许| Capture["采集麦克风音频"]
-  MicAuth -->|拒绝| MicError["提示开启麦克风权限"]
-
-  Capture --> Chunk["按 3-5 秒切分音频"]
-  Chunk --> SendWS["通过 WebSocket 发送到后端"]
-  SendWS --> VadStep["检测是否有人声"]
-
-  VadStep -->|静音| WaitMore["继续等待音频"]
-  WaitMore --> Capture
-
-  VadStep -->|有人声| Transcribe["本地 Whisper v3-turbo 转录"]
-  Transcribe --> ReturnText["返回识别文本"]
-  ReturnText --> ShowText["主界面追加显示文本"]
-  ShowText --> Continue{"是否继续录音"}
-
-  Continue -->|继续| Capture
-  Continue -->|暂停| Pause["暂停转录"]
-  Continue -->|停止| SaveSession["保存本次会话"]
-
-  Upload --> SelectFile["选择音频文件"]
-  SelectFile --> FileCheck{"文件是否有效"}
-
-  FileCheck -->|无效| FileError["提示文件格式或大小错误"]
-  FileCheck -->|有效| UploadFile["上传到后端"]
-
-  UploadFile --> Convert["ffmpeg 转码为 16kHz mono wav"]
-  Convert --> Segment["按语音段切片"]
-  Segment --> BatchTranscribe["本地 Whisper v3-turbo 批量转录"]
-  BatchTranscribe --> MergeText["合并完整转录文本"]
-  MergeText --> ShowText
-
-  SaveSession --> UserAction{"用户后续操作"}
-  ShowText --> UserAction
-
-  UserAction --> Copy["复制全文"]
-  UserAction --> ExportMd["导出 Markdown"]
-  UserAction --> NewSession["新建会话"]
-  UserAction --> History["查看历史记录"]
-  UserAction --> Settings["修改语言或主题"]
-
-  Copy --> Copied["显示复制成功"]
-  ExportMd --> DownloadMD["下载 .md 文件"]
-  NewSession --> ChooseMode
-  History --> ShowText
-  Settings --> SaveSettings["保存设置到本地"]
+```text
+backend/pyproject.toml
 ```
 
-## 3. 用户操作流程图
+Frontend dependencies are declared in:
 
-```mermaid
-flowchart TD
-  OpenApp["打开 Trisay Lite"] --> Home["进入 Dashboard"]
-  Home --> PickLanguage["选择转录语言<br/>Mandarin / Bahasa Indonesia"]
-  PickLanguage --> PickMode{"选择任务"}
-
-  PickMode --> LiveMode["实时会议转录"]
-  PickMode --> UploadMode["上传录音文件"]
-
-  LiveMode --> StartButton["点击 Start Transcription"]
-  StartButton --> Permission{"授权麦克风"}
-  Permission -->|允许| LiveText["查看实时转录文本"]
-  Permission -->|拒绝| PermissionHelp["查看权限提示"]
-
-  UploadMode --> ChooseFile["选择本地音频文件"]
-  ChooseFile --> Uploading["等待上传和识别"]
-  Uploading --> UploadedText["查看完整转录文本"]
-
-  LiveText --> Review["检查和阅读文本"]
-  UploadedText --> Review
-
-  Review --> NextAction{"后续操作"}
-  NextAction --> CopyAll["复制全文"]
-  NextAction --> ExportFile["导出 Markdown"]
-  NextAction --> PauseLive["暂停 / 继续"]
-  NextAction --> StopLive["停止并保存"]
-  NextAction --> NewMeeting["新建会话"]
-  NextAction --> OpenSettings["进入 Settings"]
-
-  CopyAll --> CopyToast["显示复制成功"]
-  ExportFile --> DownloadFile["下载 .md 文件"]
-  PauseLive --> LiveText
-  StopLive --> Saved["保存到历史记录"]
-  NewMeeting --> PickLanguage
-  OpenSettings --> ChangePrefs["修改语言 / 主题"]
-  ChangePrefs --> Home
+```text
+frontend/package.json
 ```
 
-## 4. 转录状态流转图
+## 本地开发启动
 
-```mermaid
-stateDiagram-v2
-  [*] --> Idle
+Backend:
 
-  Idle: 空闲
-  Recording: 录音中
-  Paused: 已暂停
-  Processing: 识别中
-  Uploading: 上传中
-  Completed: 已完成
-  Error: 出错
-
-  Idle --> Recording: Start Transcription
-  Recording --> Processing: 收到有效语音片段
-  Processing --> Recording: 返回识别文本
-  Recording --> Paused: Pause
-  Paused --> Recording: Resume
-  Recording --> Completed: Stop
-  Paused --> Completed: Stop
-
-  Idle --> Uploading: Upload Audio
-  Uploading --> Processing: 文件上传完成
-  Processing --> Completed: 文件识别完成
-
-  Recording --> Error: 麦克风 / WebSocket 错误
-  Uploading --> Error: 文件无效 / 上传失败
-  Processing --> Error: 模型识别失败
-  Error --> Idle: Dismiss / New Session
-
-  Completed --> Idle: New Session
-  Completed --> Completed: Copy / Export / View History
+```bash
+cd /Users/vtl/project/codex/trisay_lite/backend
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-## 5. 前后端时序图
+Frontend:
 
-```mermaid
-sequenceDiagram
-  autonumber
-  actor User as 用户
-  participant Web as Vue 前端
-  participant API as FastAPI 后端
-  participant Audio as 音频处理服务
-  participant VAD as Silero VAD
-  participant ASR as mlx-whisper
-  participant DB as SQLite / 本地存储
-
-  User->>Web: 选择语言并点击开始转录
-  Web->>User: 请求麦克风权限
-  User-->>Web: 允许麦克风
-  Web->>API: 建立 WebSocket 会话
-  API->>DB: 创建转录会话
-  DB-->>API: 返回 session_id
-  API-->>Web: 会话已建立
-
-  loop 每 3-5 秒音频片段
-    Web->>API: 发送音频 chunk
-    API->>Audio: 转码 / 标准化音频
-    Audio-->>API: 16kHz mono 音频
-    API->>VAD: 检测是否有人声
-    VAD-->>API: speech / silence
-    alt 有人声
-      API->>ASR: 调用 Whisper large-v3-turbo
-      ASR-->>API: 返回转录文本
-      API->>DB: 保存转录片段
-      API-->>Web: 推送 transcript segment
-      Web-->>User: 主界面追加显示文本
-    else 静音
-      API-->>Web: 保持连接，不追加文本
-    end
-  end
-
-  User->>Web: 点击停止
-  Web->>API: 关闭转录会话
-  API->>DB: 保存完整 transcript
-  API-->>Web: 返回完成状态
-
-  User->>Web: 点击导出 Markdown
-  Web->>API: 请求导出 .md
-  API->>DB: 读取 transcript
-  API->>DB: 保存导出文件记录
-  API-->>Web: 返回下载文件
-  Web-->>User: 下载 .md
+```bash
+cd /Users/vtl/project/codex/trisay_lite/frontend
+npm run dev
 ```
 
-## MVP 范围建议
+然后打开 Vite 提示的地址，通常是：
 
-第一版建议优先完成：
+```text
+http://127.0.0.1:5173
+```
 
-- Dashboard 主界面
-- Mandarin / Bahasa Indonesia 语言切换
-- 麦克风准实时转录
-- 上传录音文件转录
-- 暂停、停止、新建会话
-- 复制全文
-- 导出 Markdown
-- Settings 页面保存语言和主题偏好
-- SQLite 保存历史记录
+## 日常使用启动
 
-暂缓功能：
-
-- 用户账号
-- 云端同步
-- 多人说话人分离
-- 自动摘要
-- 翻译
-
-## 6. 本地发布版启动
-
-开发模式可以继续使用 Vite 和 FastAPI 两个服务。日常使用时可以构建前端生产文件，并让 FastAPI 直接托管页面：
+先构建前端生产文件：
 
 ```bash
 cd /Users/vtl/project/codex/trisay_lite/frontend
 npm run build
 ```
 
-构建完成后，只需要启动后端：
+然后从项目根目录启动后端。FastAPI 会直接托管 `frontend/dist`：
 
 ```bash
 cd /Users/vtl/project/codex/trisay_lite
-scripts/start_trisay.sh
+./scripts/start_trisay.sh
 ```
 
-然后打开：
+打开：
 
 ```text
 http://127.0.0.1:8000
 ```
 
-也可以用 macOS 启动器：
+停止服务：
 
 ```bash
+./scripts/stop_trisay.sh
+```
+
+## macOS App 启动器
+
+可以把启动器复制到 Applications：
+
+```bash
+cd /Users/vtl/project/codex/trisay_lite
 cp -R "macos/Trisay Lite.app" /Applications/
 ```
 
-复制后可通过 Spotlight 搜索 `Trisay Lite` 启动。启动器会检查 `127.0.0.1:8000` 是否已有服务；没有运行时会启动后端，并自动打开浏览器。
+之后可以通过 Spotlight 搜索 `Trisay Lite` 启动。
+
+当前 `.app` 启动器只是包装本地服务和浏览器：
+
+- 如果 `127.0.0.1:8000` 没有服务，会启动 FastAPI 后端。
+- 如果服务已经运行，会直接打开浏览器。
+- 日志写入 `storage/logs/`。
+
+注意：当前脚本仍使用本机项目路径，适合本机日常使用。若要分发给其他 Mac 用户，需要把启动脚本改成可移植路径或制作正式安装包。
+
+## 模型管理
+
+Settings -> Model Management 提供两个来源：
+
+- Catalog: 从 Hugging Face 下载已配置模型。
+- Local: 选择本地模型目录并导入到 `models/`。
+
+当前 catalog:
+
+- `Whisper Large V3 Turbo`
+  - `mlx-community/whisper-large-v3-turbo`
+  - Recommended for live transcription on Apple Silicon.
+- `Whisper Large V3`
+  - `mlx-community/whisper-large-v3-mlx`
+  - Recommended for uploaded media and higher accuracy.
+
+模型状态：
+
+- `Installed`: 模型目录存在，并且包含 `config.json`。
+- `Selected`: 当前正在使用的模型。
+- `Start`: 选择该模型作为转录模型。
+- `Stop`: 取消当前 selected 模型。
+- `Delete`: 删除本地模型目录。
+
+如果已经有模型 selected，启动另一个模型前需要先 Stop 当前模型。
+
+本地模型目录通常至少需要：
+
+- `config.json`
+- `weights.safetensors`
+- tokenizer / preprocessor 相关文件，视模型包而定
+
+`README.md` 和 `.gitattributes` 通常不是推理必需文件。
+
+## 数据存储
+
+所有运行时数据都保存在本地：
+
+```text
+storage/
+  trisay_lite.sqlite3     # sessions table
+  uploads/                # uploaded media and live snapshots
+  transcripts/            # mlx_whisper JSON output and cleaned transcript payloads
+  exports/                # exported Markdown
+  logs/                   # launcher/backend logs
+  model_settings.json     # selected model id
+```
+
+`models/`, `storage/`, `test/`, `frontend/dist/`, `backend/.venv/`, `frontend/node_modules/` 都被 `.gitignore` 忽略，不会提交到 GitHub。
+
+## API 概览
+
+Core:
+
+- `GET /health`
+- `GET /sessions`
+- `GET /sessions/{session_id}`
+- `DELETE /sessions/{session_id}`
+- `POST /transcriptions/upload`
+- `WebSocket /transcriptions/live?language=auto|zh|id`
+- `GET /exports/markdown/{session_id}`
+
+Model management:
+
+- `GET /models`
+- `GET /models/local`
+- `POST /models/{model_id}/download`
+- `POST /models/{model_id}/select`
+- `POST /models/{model_id}/stop`
+- `DELETE /models/{model_id}`
+- `POST /models/local/import`
+
+## 当前已知限制
+
+- 实时转录目前会累积浏览器录音片段并发送快照，长时间录音会变慢，可能触发 timeout。
+- 实时模式固定每个 chunk 的后端转录超时为 120 秒；`large-v3` 更适合上传文件，不适合实时。
+- Hugging Face 下载器比较基础，没有断点续传、校验和和多次自动重试。
+- 本地模型导入会通过浏览器上传目录到本机后端，大模型导入时可能有内存和浏览器确认弹窗问题。
+- 部分历史实时 session 可能因为浏览器或后端异常退出而停留在 `processing` 状态。
+- 目前没有正式自动化测试。
+
+## 验证命令
+
+Backend syntax check:
+
+```bash
+cd /Users/vtl/project/codex/trisay_lite
+backend/.venv/bin/python -m compileall backend/app
+```
+
+Frontend build:
+
+```bash
+cd /Users/vtl/project/codex/trisay_lite/frontend
+npm run build
+```
+
+Health check:
+
+```bash
+curl -s http://127.0.0.1:8000/health
+```
+
+Expected:
+
+```json
+{"status":"ok"}
+```
